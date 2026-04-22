@@ -1,152 +1,171 @@
 /**
- * 444Music — Spotify API Integration Module
- * Client Credentials Flow (backend proxy not required for public data)
- * Token auto-refreshes on expiry
+ * 444Music — Spotify API Integration Module (FIXED)
+ * Client Credentials Flow (no backend required for basic use)
  */
 
-// ⚠️  Replace with your own Spotify app credentials
-// Create app at: https://developer.spotify.com/dashboard
-const CLIENT_ID = "b0f47f3417274e48b59174e5477cece4";
-const REDIRECT_URI = "https://444musics.vercel.app/callback";
-const BASE = 'https://api.spotify.com/v1';
+const SPOTIFY_CLIENT_ID = "b0f47f3417274e48b59174e5477cece4";
+const SPOTIFY_CLIENT_SECRET = "00a01cb804544454afb9ed1b3a7a5a85"; // ⚠️ keep private
+const BASE = "https://api.spotify.com/v1";
 
 let _token = null;
 let _tokenExpiry = 0;
 
+// ─── GET ACCESS TOKEN ─────────────────────────────────────────────
 export async function getSpotifyToken() {
   if (_token && Date.now() < _tokenExpiry - 60000) return _token;
+
   try {
-    const res = await fetch('https://accounts.spotify.com/api/token', {
-      method: 'POST',
+    const res = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: 'Basic ' + btoa(SPOTIFY_CLIENT_ID + ':' + SPOTIFY_CLIENT_SECRET),
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization:
+          "Basic " +
+          btoa(SPOTIFY_CLIENT_ID + ":" + SPOTIFY_CLIENT_SECRET),
       },
-      body: 'grant_type=client_credentials',
+      body: "grant_type=client_credentials",
     });
-    if (!res.ok) throw new Error('Token fetch failed');
+
+    if (!res.ok) throw new Error("Token request failed");
+
     const data = await res.json();
     _token = data.access_token;
     _tokenExpiry = Date.now() + data.expires_in * 1000;
+
     return _token;
-  } catch (e) {
-    console.error('[Spotify] Token error:', e);
+  } catch (err) {
+    console.error("[Spotify] Token error:", err);
     return null;
   }
 }
 
+// ─── FETCH WRAPPER ────────────────────────────────────────────────
 async function spotifyFetch(path) {
   const token = await getSpotifyToken();
   if (!token) return null;
+
   try {
     const res = await fetch(BASE + path, {
-      headers: { Authorization: 'Bearer ' + token },
+      headers: {
+        Authorization: "Bearer " + token,
+      },
     });
+
     if (!res.ok) {
-      if (res.status === 401) { _token = null; return spotifyFetch(path); }
+      if (res.status === 401) {
+        _token = null;
+        return spotifyFetch(path);
+      }
       return null;
     }
-    return res.json();
-  } catch (e) {
-    console.error('[Spotify] Fetch error:', path, e);
+
+    return await res.json();
+  } catch (err) {
+    console.error("[Spotify Fetch Error]", err);
     return null;
   }
 }
 
-// ─── Normalise raw Spotify track → 444Music track object ───────────────────
+// ─── NORMALISERS ───────────────────────────────────────────────────
 export function normaliseTrack(t) {
   if (!t) return null;
+
   return {
     id: t.id,
     spotifyId: t.id,
     title: t.name,
-    artist: t.artists?.map(a => a.name).join(', ') || 'Unknown',
+    artist: t.artists?.map(a => a.name).join(", ") || "Unknown",
     artistId: t.artists?.[0]?.id || null,
-    album: t.album?.name || '',
+    album: t.album?.name || "",
     cover_url: t.album?.images?.[0]?.url || null,
     preview_url: t.preview_url || null,
     spotify_url: t.external_urls?.spotify || null,
     duration_ms: t.duration_ms || 0,
     streams: t.popularity ? t.popularity * 1000 : 0,
-    source: 'spotify',
+    source: "spotify",
   };
 }
 
 export function normaliseAlbum(a) {
   if (!a) return null;
+
   return {
     id: a.id,
     title: a.name,
-    artist: a.artists?.map(x => x.name).join(', ') || '',
+    artist: a.artists?.map(x => x.name).join(", ") || "",
     cover_url: a.images?.[0]?.url || null,
     spotify_url: a.external_urls?.spotify || null,
-    release_date: a.release_date || '',
-    source: 'spotify',
+    release_date: a.release_date || "",
+    source: "spotify",
     isAlbum: true,
   };
 }
 
-// ─── HOME FEED ──────────────────────────────────────────────────────────────
+// ─── HOME FEED ────────────────────────────────────────────────────
 export async function getNewReleases(limit = 10) {
-  const data = await spotifyFetch(`/browse/new-releases?limit=${limit}&country=GH`);
+  const data = await spotifyFetch(
+    `/browse/new-releases?limit=${limit}&country=GH`
+  );
+
   return data?.albums?.items?.map(normaliseAlbum) || [];
 }
 
-export async function getNewReleaseTracks(albumId, limit = 5) {
-  const data = await spotifyFetch(`/albums/${albumId}/tracks?limit=${limit}`);
-  // Tracks inside album endpoint are simplified — fetch full tracks for preview_url
-  const ids = data?.items?.map(t => t.id).join(',');
-  if (!ids) return [];
-  return getTracksByIds(ids);
-}
-
 export async function getTrendingTracks(limit = 20) {
-  // Spotify's featured playlists → grab top tracks
-  const fp = await spotifyFetch(`/browse/featured-playlists?limit=1&country=GH`);
+  const fp = await spotifyFetch(
+    `/browse/featured-playlists?limit=1&country=GH`
+  );
+
   const playlistId = fp?.playlists?.items?.[0]?.id;
-  if (!playlistId) return getFallbackTrending();
-  const data = await spotifyFetch(`/playlists/${playlistId}/tracks?limit=${limit}&fields=items(track)`);
-  return data?.items
-    ?.map(i => i.track)
-    .filter(Boolean)
-    .map(normaliseTrack) || [];
+
+  if (!playlistId) return searchTracks("top hits ghana", limit);
+
+  const data = await spotifyFetch(
+    `/playlists/${playlistId}/tracks?limit=${limit}`
+  );
+
+  return (
+    data?.items?.map(i => i.track).filter(Boolean).map(normaliseTrack) || []
+  );
 }
 
 export async function getAfroPicks(limit = 20) {
-  // Search specifically for Afrobeats hits
-  return searchTracks('afrobeats hits 2024', limit);
+  return searchTracks("afrobeats hits 2024", limit);
 }
 
-async function getFallbackTrending() {
-  return searchTracks('top hits 2024', 20);
-}
-
-export async function getTracksByIds(ids) {
-  const data = await spotifyFetch(`/tracks?ids=${ids}`);
-  return data?.tracks?.filter(Boolean).map(normaliseTrack) || [];
-}
-
-// ─── SEARCH ─────────────────────────────────────────────────────────────────
+// ─── SEARCH ───────────────────────────────────────────────────────
 export async function searchTracks(query, limit = 20) {
   if (!query?.trim()) return [];
-  const q = encodeURIComponent(query.trim());
-  const data = await spotifyFetch(`/search?q=${q}&type=track&limit=${limit}`);
-  return data?.tracks?.items?.filter(Boolean).map(normaliseTrack) || [];
+
+  const data = await spotifyFetch(
+    `/search?q=${encodeURIComponent(query)}&type=track&limit=${limit}`
+  );
+
+  return (
+    data?.tracks?.items?.filter(Boolean).map(normaliseTrack) || []
+  );
 }
 
 export async function searchAll(query, limit = 10) {
-  if (!query?.trim()) return { tracks: [], artists: [], albums: [] };
-  const q = encodeURIComponent(query.trim());
-  const data = await spotifyFetch(`/search?q=${q}&type=track,artist,album&limit=${limit}`);
+  if (!query?.trim()) return { tracks: [], albums: [] };
+
+  const data = await spotifyFetch(
+    `/search?q=${encodeURIComponent(query)}&type=track,album&limit=${limit}`
+  );
+
   return {
-    tracks: data?.tracks?.items?.filter(Boolean).map(normaliseTrack) || [],
-    albums: data?.albums?.items?.filter(Boolean).map(normaliseAlbum) || [],
+    tracks:
+      data?.tracks?.items?.filter(Boolean).map(normaliseTrack) || [],
+    albums:
+      data?.albums?.items?.filter(Boolean).map(normaliseAlbum) || [],
   };
 }
 
-// ─── ARTIST ─────────────────────────────────────────────────────────────────
-export async function getArtistTopTracks(artistId, market = 'GH') {
-  const data = await spotifyFetch(`/artists/${artistId}/top-tracks?market=${market}`);
+// ─── ARTIST ───────────────────────────────────────────────────────
+export async function getArtistTopTracks(artistId, market = "GH") {
+  const data = await spotifyFetch(
+    `/artists/${artistId}/top-tracks?market=${market}`
+  );
+
   return data?.tracks?.map(normaliseTrack) || [];
 }
 
@@ -154,15 +173,15 @@ export async function getArtist(artistId) {
   return spotifyFetch(`/artists/${artistId}`);
 }
 
-// ─── GENRE SEARCH MAP ───────────────────────────────────────────────────────
+// ─── GENRE MAP ────────────────────────────────────────────────────
 export const GENRE_QUERIES = {
-  Afrobeats: 'afrobeats',
-  'Hip-Hop': 'hip hop rap 2024',
-  'R&B': 'r&b soul 2024',
-  Pop: 'pop hits 2024',
-  Gospel: 'gospel worship 2024',
-  Highlife: 'highlife ghana',
-  Dancehall: 'dancehall reggae',
-  Drill: 'drill uk afro',
-  Amapiano: 'amapiano 2024',
+  Afrobeats: "afrobeats",
+  "Hip-Hop": "hip hop rap 2024",
+  "R&B": "r&b soul 2024",
+  Pop: "pop hits 2024",
+  Gospel: "gospel worship 2024",
+  Highlife: "highlife ghana",
+  Dancehall: "dancehall reggae",
+  Drill: "drill uk afro",
+  Amapiano: "amapiano 2024",
 };
