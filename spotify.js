@@ -6,9 +6,8 @@
 
 // ⚠️  Replace with your own Spotify app credentials
 // Create app at: https://developer.spotify.com/dashboard
-const SPOTIFY_CLIENT_ID = 'YOUR_SPOTIFY_CLIENT_ID';
-const SPOTIFY_CLIENT_SECRET = 'YOUR_SPOTIFY_CLIENT_SECRET';
-
+const CLIENT_ID = "b0f47f3417274e48b59174e5477cece4";
+const REDIRECT_URI = "https://444musics.vercel.app/callback";
 const BASE = 'https://api.spotify.com/v1';
 
 let _token = null;
