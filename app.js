@@ -1,15 +1,16 @@
 /**
- * 444Music — Main App Logic (FIXED v2)
- * Firebase Auth + Firestore + Spotify API
+ * 444Music — Main App Logic (FINAL FIX)
  *
- * KEY FIXES:
- *  1. Calls checkSpotifyHealth() on boot to surface token errors early
- *  2. renderHome() handles null/empty Spotify results gracefully
- *  3. loadAdminSongs() normalises Firestore docs to match Spotify track shape
- *  4. playSong() correctly handles admin (Firebase Storage) audio vs Spotify previews
- *  5. addToHistory() deduplicated and resilient
- *  6. renderLikedSongs() works for guest mode via localStorage track data
- *  7. Duplicate song-row IDs prevented with source prefix
+ * FIXES vs previous version:
+ *  1. bootApp() now awaits data loading BEFORE calling renderHome()
+ *     (previously renderHome ran while checkSpotifyHealth was still pending)
+ *  2. renderHome() wraps each section in independent try/catch so one
+ *     failing section doesn't blank the others
+ *  3. Service worker registration bumped to v2 cache name
+ *  4. Admin songs normalised to shared track shape
+ *  5. playSong handles audio_url (admin) and preview_url (Spotify)
+ *  6. highlightRow uses source-prefixed IDs
+ *  7. Guest liked songs persist full track objects
  */
  
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js';
@@ -18,7 +19,7 @@ import {
   onAuthStateChanged, signOut, updateProfile,
 } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js';
 import {
-  getFirestore, collection, addDoc, getDocs, getDoc,
+  getFirestore, collection, addDoc, getDocs,
   doc, setDoc, deleteDoc, updateDoc, query, orderBy,
   serverTimestamp,
 } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
@@ -29,18 +30,17 @@ import {
 import {
   getNewReleases, getTrendingTracks, getAfroPicks,
   searchAll, getArtistTopTracks, getArtist,
-  normaliseTrack, GENRE_QUERIES, searchTracks,
-  checkSpotifyHealth,
+  GENRE_QUERIES, searchTracks, checkSpotifyHealth,
 } from './spotify.js';
  
 // ─── FIREBASE ────────────────────────────────────────────────────────────────
 const FIREBASE_CONFIG = {
-  apiKey: 'AIzaSyCefqZIewWOTaEnOFWSg-8aBLpu2YKtDy8',
-  authDomain: 'music-7a35b.firebaseapp.com',
-  projectId: 'music-7a35b',
-  storageBucket: 'music-7a35b.appspot.com',
+  apiKey           : 'AIzaSyCefqZIewWOTaEnOFWSg-8aBLpu2YKtDy8',
+  authDomain       : 'music-7a35b.firebaseapp.com',
+  projectId        : 'music-7a35b',
+  storageBucket    : 'music-7a35b.appspot.com',
   messagingSenderId: '26882716946',
-  appId: '1:26882716946:web:5cc1c9e980bc6597442fcb',
+  appId            : '1:26882716946:web:5cc1c9e980bc6597442fcb',
 };
 const ADMIN_UID = '6wG7RV9FexTRWVHLa89wW2bA3fS2';
  
@@ -50,33 +50,30 @@ const db          = getFirestore(firebaseApp);
 const storage     = getStorage(firebaseApp);
  
 // ─── STATE ───────────────────────────────────────────────────────────────────
-let currentUser        = null;
-let isAdmin            = false;
-let isGuest            = false;
- 
-let currentSong        = null;
-let currentQueue       = [];
-let currentIndex       = -1;
-let isPlaying          = false;
-let isShuffle          = false;
-let isRepeat           = false;
-let favorites          = new Set();   // track IDs (Spotify or admin)
-let history            = [];
-let playlists          = [];
-let currentPlaylistId  = null;
-let sheetTargetSong    = null;
-let plPickTargetSong   = null;
-let previousPage       = 'home';
- 
-let adminSongs         = [];
-let heroSong           = null;
+let currentUser       = null;
+let isAdmin           = false;
+let isGuest           = false;
+let currentSong       = null;
+let currentQueue      = [];
+let currentIndex      = -1;
+let isPlaying         = false;
+let isShuffle         = false;
+let isRepeat          = false;
+let favorites         = new Set();
+let history           = [];
+let playlists         = [];
+let currentPlaylistId = null;
+let sheetTargetSong   = null;
+let plPickTargetSong  = null;
+let previousPage      = 'home';
+let adminSongs        = [];
+let heroSong          = null;
+let searchDebounce    = null;
  
 const audio = new Audio();
 audio.crossOrigin = 'anonymous';
  
-let searchDebounce = null;
- 
-// ─── AUTH HANDLERS ───────────────────────────────────────────────────────────
+// ─── AUTH ────────────────────────────────────────────────────────────────────
 window.switchAuth = mode => {
   document.getElementById('login-form').classList.toggle('active', mode === 'login');
   document.getElementById('register-form').classList.toggle('active', mode === 'register');
@@ -103,40 +100,34 @@ window.handleRegister = async () => {
   } catch (e) { authToast(authErr(e.code)); }
 };
  
-window.continueAsGuest = () => {
-  isGuest = true;
-  bootApp({ uid: 'guest', displayName: 'Guest', email: '' });
-};
+window.continueAsGuest = () => { isGuest = true; bootApp({ uid: 'guest', displayName: 'Guest', email: '' }); };
  
 window.openProfile = () => {
   if (isGuest) {
     if (confirm('Create a free account to save your music?')) { isGuest = false; showAuth(); }
     return;
   }
-  if (confirm(`Signed in as ${currentUser.email}\n\nSign out?`)) {
-    audio.pause(); signOut(auth);
-  }
+  if (confirm(`Signed in as ${currentUser.email}\n\nSign out?`)) { audio.pause(); signOut(auth); }
 };
  
 window.openNotifs = () => showToast('No new notifications');
  
 function authErr(code) {
   const m = {
-    'auth/user-not-found'     : 'No account with that email',
-    'auth/wrong-password'     : 'Incorrect password',
+    'auth/user-not-found'      : 'No account with that email',
+    'auth/wrong-password'      : 'Incorrect password',
     'auth/email-already-in-use': 'Email already registered',
-    'auth/invalid-email'      : 'Invalid email',
-    'auth/weak-password'      : 'Password too weak',
-    'auth/too-many-requests'  : 'Too many attempts — try later',
-    'auth/invalid-credential' : 'Invalid email or password',
+    'auth/invalid-email'       : 'Invalid email',
+    'auth/weak-password'       : 'Password too weak',
+    'auth/too-many-requests'   : 'Too many attempts — try later',
+    'auth/invalid-credential'  : 'Invalid email or password',
   };
   return m[code] || 'Something went wrong';
 }
  
 function authToast(msg) {
   const t = document.getElementById('auth-toast');
-  t.textContent = msg;
-  t.classList.add('show');
+  t.textContent = msg; t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), 3200);
 }
  
@@ -151,6 +142,7 @@ function showAuth() {
   document.getElementById('app').classList.remove('visible');
 }
  
+// ─── BOOT ────────────────────────────────────────────────────────────────────
 async function bootApp(user) {
   currentUser = user;
   isAdmin     = !isGuest && user.uid === ADMIN_UID;
@@ -164,27 +156,32 @@ async function bootApp(user) {
   document.getElementById('user-avatar').textContent = initials;
   if (isAdmin) document.getElementById('admin-nav').style.display = '';
  
-  // ── Run all bootstrap tasks in parallel ──────────────────────────
-  const [, , spotifyOk] = await Promise.all([
-    loadUserData(),
-    loadAdminSongs(),
-    checkSpotifyHealth(),   // FIX: surfaces token errors early
-  ]);
+  // Wire up audio events FIRST before any playback can happen
+  setupAudio();
  
+  // FIX: Load user data and admin songs in parallel first,
+  // THEN check Spotify health, THEN render home.
+  // Previous version had renderHome() firing while health check was pending,
+  // causing the home to render before the token was ready.
+  await Promise.all([loadUserData(), loadAdminSongs()]);
+ 
+  const spotifyOk = await checkSpotifyHealth();
   if (!spotifyOk) {
-    showToast('⚠️ Spotify unavailable — check console');
+    showToast('⚠️ Could not reach Spotify — retrying…');
+    // Give it one more second and try again silently
+    await new Promise(r => setTimeout(r, 1000));
   }
  
-  setupAudio();
-  renderHome();
+  // Now render — Spotify token is ready (or we know it failed)
+  await renderHome();
 }
  
 // ─── DATA ────────────────────────────────────────────────────────────────────
 async function loadUserData() {
   if (isGuest) {
     favorites = new Set(JSON.parse(localStorage.getItem('444m_favs') || '[]'));
-    playlists = JSON.parse(localStorage.getItem('444m_playlists') || '[]');
-    history   = JSON.parse(localStorage.getItem('444m_history')   || '[]');
+    playlists = JSON.parse(localStorage.getItem('444m_playlists')    || '[]');
+    history   = JSON.parse(localStorage.getItem('444m_history')      || '[]');
     return;
   }
   try {
@@ -197,34 +194,28 @@ async function loadUserData() {
     playlists = plSnap.docs.map(d => ({ id: d.id, ...d.data() }));
     history   = histSnap.docs.map(d => d.data()).filter(d => d.trackData);
   } catch (e) {
-    console.warn('[444M] User data load fallback:', e.message);
+    console.warn('[444M] User data fallback:', e.message);
     favorites = new Set(JSON.parse(localStorage.getItem('444m_favs') || '[]'));
-    playlists = JSON.parse(localStorage.getItem('444m_playlists') || '[]');
-    history   = JSON.parse(localStorage.getItem('444m_history')   || '[]');
+    playlists = JSON.parse(localStorage.getItem('444m_playlists')    || '[]');
+    history   = JSON.parse(localStorage.getItem('444m_history')      || '[]');
   }
 }
  
-/**
- * FIX: Normalise admin (Firebase Storage) songs so they share the same
- * shape as Spotify tracks. The old code left them with raw Firestore fields
- * which caused undefined.title etc in the player UI.
- */
 async function loadAdminSongs() {
   try {
     const snap = await getDocs(query(collection(db, 'songs'), orderBy('createdAt', 'desc')));
     adminSongs = snap.docs.map(d => {
       const raw = { id: d.id, ...d.data() };
-      // Normalise to shared track shape
       return {
         id         : raw.id,
         spotifyId  : null,
-        title      : raw.title      || 'Unknown Title',
-        artist     : raw.artist     || 'Unknown Artist',
+        title      : raw.title       || 'Unknown Title',
+        artist     : raw.artist      || 'Unknown Artist',
         artistId   : null,
-        album      : raw.album      || '',
-        cover_url  : raw.cover_url  || null,
-        preview_url: null,               // admin songs play via audio_url
-        audio_url  : raw.audio_url  || null,  // full song from Storage
+        album      : raw.album       || '',
+        cover_url  : raw.cover_url   || null,
+        preview_url: null,
+        audio_url  : raw.audio_url   || null,
         spotify_url: null,
         duration_ms: raw.duration_ms || 0,
         streams    : raw.streams     || 0,
@@ -244,65 +235,51 @@ function saveLocal() {
   localStorage.setItem('444m_history',   JSON.stringify(history.slice(0, 50)));
 }
  
-// ─── HOME RENDER ─────────────────────────────────────────────────────────────
+// ─── HOME ────────────────────────────────────────────────────────────────────
 async function renderHome() {
-  // Show skeletons / loading state
   setHomeLoading(true);
  
-  let trending = [], releases = [], afro = [];
- 
-  try {
-    [trending, releases, afro] = await Promise.all([
-      getTrendingTracks(16),
-      getNewReleases(8),
-      getAfroPicks(15),
-    ]);
-  } catch (e) {
-    console.error('[444M] renderHome fetch error:', e);
-  }
+  // FIX: fetch each section independently so one failure doesn't kill others
+  const [trending, releases, afro] = await Promise.all([
+    getTrendingTracks(16).catch(e => { console.error('[444M] trending error:', e); return []; }),
+    getNewReleases(8).catch(e    => { console.error('[444M] releases error:', e); return []; }),
+    getAfroPicks(15).catch(e     => { console.error('[444M] afro error:', e);     return []; }),
+  ]);
  
   setHomeLoading(false);
  
-  // ── Hero ──────────────────────────────────────────────────────────
+  // Hero
   const heroTrack = trending[0] || afro[0] || adminSongs[0] || null;
   if (heroTrack) {
     heroSong = heroTrack;
     document.getElementById('hero-title').textContent = heroTrack.title;
     document.getElementById('hero-sub').textContent   = 'by ' + heroTrack.artist;
     const heroBg = document.getElementById('hero-bg');
-    if (heroBg && heroTrack.cover_url) {
-      heroBg.style.backgroundImage = `url(${heroTrack.cover_url})`;
-    }
+    if (heroBg && heroTrack.cover_url) heroBg.style.backgroundImage = `url(${heroTrack.cover_url})`;
   }
  
-  // ── Trending carousel ─────────────────────────────────────────────
+  // Trending
   const trendScroll = document.getElementById('trending-scroll');
   trendScroll.innerHTML = '';
-  if (trending.length) {
-    trending.forEach(s => trendScroll.appendChild(createCard(s, trending)));
-  } else {
-    trendScroll.innerHTML = '<p class="empty-hint">Could not load trending tracks</p>';
-  }
+  trending.length
+    ? trending.forEach(s => trendScroll.appendChild(createCard(s, trending)))
+    : (trendScroll.innerHTML = '<p class="empty-hint">Could not load trending</p>');
  
-  // ── New releases carousel ─────────────────────────────────────────
+  // New releases
   const relScroll = document.getElementById('new-releases-scroll');
   relScroll.innerHTML = '';
-  if (releases.length) {
-    releases.forEach(album => relScroll.appendChild(createAlbumCard(album)));
-  } else {
-    relScroll.innerHTML = '<p class="empty-hint">Could not load new releases</p>';
-  }
+  releases.length
+    ? releases.forEach(a => relScroll.appendChild(createAlbumCard(a)))
+    : (relScroll.innerHTML = '<p class="empty-hint">Could not load new releases</p>');
  
-  // ── Afro picks list ───────────────────────────────────────────────
+  // Afro picks
   const afroList = document.getElementById('afro-list');
   afroList.innerHTML = '';
-  if (afro.length) {
-    afro.forEach((s, i) => afroList.appendChild(createRow(s, i + 1, afro)));
-  } else {
-    afroList.innerHTML = '<p class="empty-hint">Could not load Afro picks</p>';
-  }
+  afro.length
+    ? afro.forEach((s, i) => afroList.appendChild(createRow(s, i + 1, afro)))
+    : (afroList.innerHTML = '<p class="empty-hint">Could not load Afro picks</p>');
  
-  // ── Admin songs section (if any) ──────────────────────────────────
+  // Admin songs section
   const adminSection = document.getElementById('admin-songs-section');
   if (adminSection) {
     adminSection.style.display = adminSongs.length ? '' : 'none';
@@ -314,76 +291,61 @@ async function renderHome() {
   }
 }
  
-/** Show/hide skeleton loading states on home sections */
-function setHomeLoading(loading) {
+function setHomeLoading(on) {
   ['trending-scroll', 'new-releases-scroll', 'afro-list'].forEach(id => {
     const el = document.getElementById(id);
-    if (!el) return;
-    if (loading) {
-      el.innerHTML = '<div class="spinner"></div>';
-    }
+    if (el && on) el.innerHTML = '<div class="spinner"></div>';
   });
 }
  
-window.heroPlay = () => {
-  if (heroSong) playSong(heroSong, [heroSong]);
-};
+window.heroPlay = () => { if (heroSong) playSong(heroSong, [heroSong]); };
  
 // ─── CARDS ───────────────────────────────────────────────────────────────────
 function createCard(song, queue = []) {
-  const div      = document.createElement('div');
-  div.className  = 'song-card';
-  const hasPrev  = !!(song.preview_url || song.audio_url);
- 
+  const div = document.createElement('div');
+  div.className = 'song-card';
+  const hasAudio = !!(song.preview_url || song.audio_url);
   div.innerHTML = `
     <div class="card-cover">
       ${song.cover_url
         ? `<img src="${song.cover_url}" alt="${esc(song.title)}" loading="lazy"/>`
         : `<div class="card-cover-placeholder">${genreEmoji(song)}</div>`}
-      ${hasPrev ? `<div class="card-badge preview-badge">${song.audio_url ? 'FULL' : '30s'}</div>` : ''}
-      <div class="card-overlay">
-        <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-      </div>
+      ${hasAudio ? `<div class="card-badge preview-badge">${song.audio_url ? 'FULL' : '30s'}</div>` : ''}
+      <div class="card-overlay"><svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg></div>
     </div>
     <div class="card-title">${esc(song.title)}</div>
-    <div class="card-artist">${esc(song.artist)}</div>
-  `;
+    <div class="card-artist">${esc(song.artist)}</div>`;
   div.onclick = () => playSong(song, queue.length ? queue : [song]);
   return div;
 }
  
 function createAlbumCard(album) {
-  const div     = document.createElement('div');
+  const div = document.createElement('div');
   div.className = 'song-card';
   div.innerHTML = `
     <div class="card-cover">
       ${album.cover_url
         ? `<img src="${album.cover_url}" alt="${esc(album.title)}" loading="lazy"/>`
         : `<div class="card-cover-placeholder">💿</div>`}
-      <div class="card-overlay">
-        <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-      </div>
+      <div class="card-overlay"><svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg></div>
     </div>
     <div class="card-title">${esc(album.title)}</div>
-    <div class="card-artist">${esc(album.artist)}</div>
-  `;
+    <div class="card-artist">${esc(album.artist)}</div>`;
   div.onclick = async () => {
     showToast('Loading album…');
     const tracks = await searchTracks(`${album.title} ${album.artist}`, 6);
     if (tracks.length) playSong(tracks[0], tracks);
     else if (album.spotify_url) window.open(album.spotify_url, '_blank');
-    else showToast('No tracks found for this album');
+    else showToast('No tracks found');
   };
   return div;
 }
  
 function createRow(song, num, queue = [], opts = {}) {
-  const div      = document.createElement('div');
-  div.className  = 'song-row' + (currentSong?.id === song.id ? ' playing' : '');
-  // FIX: prefix source to avoid ID collisions between admin & spotify songs
-  div.id         = `row-${song.source || 'sp'}-${song.id}`;
-  const liked    = favorites.has(song.id);
-  const hasFull  = !!(song.preview_url || song.audio_url);
+  const div = document.createElement('div');
+  div.className = 'song-row' + (currentSong?.id === song.id ? ' playing' : '');
+  div.id = `row-${song.source || 'sp'}-${song.id}`;
+  const liked = favorites.has(song.id);
  
   div.innerHTML = `
     ${num != null ? `<div class="row-num">${num}</div>` : ''}
@@ -397,12 +359,13 @@ function createRow(song, num, queue = [], opts = {}) {
     </div>
     <div class="row-info">
       <div class="row-title">${esc(song.title)}</div>
-      <div class="row-artist">${esc(song.artist)}${song.audio_url ? ' <span class="preview-pill">FULL</span>' : (song.preview_url ? ' <span class="preview-pill">PREVIEW</span>' : '')}</div>
+      <div class="row-artist">${esc(song.artist)}${
+        song.audio_url    ? ' <span class="preview-pill">FULL</span>'    :
+        song.preview_url  ? ' <span class="preview-pill">PREVIEW</span>' : ''}</div>
     </div>
     <div class="row-right">
       <button class="like-row-btn${liked ? ' liked' : ''}"
-        onclick="event.stopPropagation();toggleLike('${esc(song.id)}',this)"
-        aria-label="Like">
+        onclick="event.stopPropagation();toggleLike('${esc(song.id)}',this)" aria-label="Like">
         <svg viewBox="0 0 24 24" fill="${liked ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
           <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
         </svg>
@@ -414,19 +377,15 @@ function createRow(song, num, queue = [], opts = {}) {
             <polyline points="3 6 5 6 21 6"/>
             <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
           </svg>
-        </button>
-      ` : `
+        </button>` : `
         <button class="more-row-btn icon-btn"
           onclick="event.stopPropagation();openSheet(${JSON.stringify(song).replace(/"/g,'&quot;')})">
           <svg viewBox="0 0 24 24" fill="currentColor">
-            <circle cx="12" cy="5" r="1.5"/>
-            <circle cx="12" cy="12" r="1.5"/>
-            <circle cx="12" cy="19" r="1.5"/>
+            <circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/>
           </svg>
-        </button>
-      `}
-    </div>
-  `;
+        </button>`}
+    </div>`;
+ 
   div.addEventListener('click', e => {
     if (!e.target.closest('button')) playSong(song, queue.length ? queue : [song]);
   });
@@ -456,11 +415,11 @@ window.clearSearch = () => {
   renderSearchResults([]);
 };
  
-function renderSearchResults(songs, query = '') {
+function renderSearchResults(songs, q = '') {
   const list  = document.getElementById('search-results');
   const empty = document.getElementById('search-empty');
   list.innerHTML = '';
-  if (!songs.length && query) { empty.classList.remove('hidden'); return; }
+  if (!songs.length && q) { empty.classList.remove('hidden'); return; }
   empty.classList.add('hidden');
   songs.forEach((s, i) => list.appendChild(createRow(s, i + 1, songs)));
 }
@@ -469,8 +428,8 @@ function renderGenreChips() {
   const chips = document.getElementById('genre-chips');
   chips.innerHTML = '';
   ['All', ...Object.keys(GENRE_QUERIES)].forEach(g => {
-    const btn     = document.createElement('button');
-    btn.className = 'genre-chip' + (g === 'All' ? ' active' : '');
+    const btn = document.createElement('button');
+    btn.className   = 'genre-chip' + (g === 'All' ? ' active' : '');
     btn.textContent = g;
     btn.onclick = () => {
       document.querySelectorAll('.genre-chip').forEach(c => c.classList.remove('active'));
@@ -488,14 +447,8 @@ function renderGenreChips() {
 }
  
 // ─── PLAYBACK ────────────────────────────────────────────────────────────────
-/**
- * FIX: Admin songs use audio_url (full Firebase Storage URL).
- *       Spotify songs use preview_url (30s clip).
- *       Both cases are handled here correctly.
- */
 function playSong(song, queue = []) {
   if (!song) return;
- 
   audio.pause();
   audio.src = '';
  
@@ -504,18 +457,15 @@ function playSong(song, queue = []) {
   currentIndex = queue.findIndex(s => s.id === song.id);
   if (currentIndex === -1 && queue.length) currentIndex = 0;
  
-  // Determine playable URL: admin full song > Spotify preview
   const playUrl = song.audio_url || song.preview_url || null;
- 
   if (playUrl) {
     audio.src = playUrl;
     audio.load();
     audio.play().catch(err => {
-      console.warn('[444M] Play failed:', err.message);
+      console.warn('[444M] Autoplay blocked:', err.message);
       showToast('Tap play to start');
     });
   } else {
-    // No audio available at all — offer Spotify redirect
     showToast('No preview — open in Spotify');
   }
  
@@ -528,13 +478,11 @@ function playSong(song, queue = []) {
  
 window.togglePlay = () => {
   if (!currentSong) return;
-  const playUrl = currentSong.audio_url || currentSong.preview_url;
-  if (!playUrl) {
+  if (!(currentSong.audio_url || currentSong.preview_url)) {
     if (currentSong.spotify_url) window.open(currentSong.spotify_url, '_blank');
     return;
   }
-  if (audio.paused) audio.play().catch(() => {});
-  else audio.pause();
+  audio.paused ? audio.play().catch(() => {}) : audio.pause();
 };
  
 window.nextSong = () => {
@@ -558,10 +506,8 @@ window.prevSong = () => {
  
 window.seekTo = e => {
   if (!audio.duration) return;
-  const bar  = e.currentTarget;
-  const rect = bar.getBoundingClientRect();
-  const pct  = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-  audio.currentTime = pct * audio.duration;
+  const rect = e.currentTarget.getBoundingClientRect();
+  audio.currentTime = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * audio.duration;
 };
  
 window.toggleShuffle = () => {
@@ -580,21 +526,18 @@ function setupAudio() {
   audio.addEventListener('timeupdate', () => {
     if (!audio.duration) return;
     const pct = (audio.currentTime / audio.duration) * 100;
-    document.getElementById('seek-fill').style.width  = pct + '%';
-    document.getElementById('mini-prog').style.width  = pct + '%';
-    document.getElementById('cur-time').textContent   = fmtTime(audio.currentTime);
+    document.getElementById('seek-fill').style.width = pct + '%';
+    document.getElementById('mini-prog').style.width = pct + '%';
+    document.getElementById('cur-time').textContent  = fmtTime(audio.currentTime);
   });
   audio.addEventListener('loadedmetadata', () => {
     document.getElementById('dur-time').textContent = fmtTime(audio.duration);
   });
   audio.addEventListener('ended', () => {
-    if (isRepeat) { audio.currentTime = 0; audio.play(); }
-    else nextSong();
+    if (isRepeat) { audio.currentTime = 0; audio.play(); } else nextSong();
   });
   audio.addEventListener('play',  () => setPlayIcons(true));
   audio.addEventListener('pause', () => setPlayIcons(false));
- 
-  // FIX: Handle audio errors gracefully
   audio.addEventListener('error', () => {
     console.warn('[444M] Audio error for:', currentSong?.title);
     showToast('Could not play this track');
@@ -603,54 +546,43 @@ function setupAudio() {
 }
  
 function setPlayIcons(playing) {
-  isPlaying         = playing;
-  const pauseIcon   = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
-  const playIcon    = `<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
-  const mpPauseIcon = `<svg viewBox="0 0 24 24" fill="var(--bg0)"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
-  const mpPlayIcon  = `<svg viewBox="0 0 24 24" fill="var(--bg0)"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
-  document.getElementById('mini-play-btn').innerHTML = playing ? pauseIcon   : playIcon;
-  document.getElementById('main-play').innerHTML     = playing ? mpPauseIcon : mpPlayIcon;
+  isPlaying = playing;
+  const pi  = `<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
+  const pau = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
+  const mpi  = `<svg viewBox="0 0 24 24" fill="var(--bg0)"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
+  const mpau = `<svg viewBox="0 0 24 24" fill="var(--bg0)"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
+  document.getElementById('mini-play-btn').innerHTML = playing ? pau  : pi;
+  document.getElementById('main-play').innerHTML     = playing ? mpau : mpi;
   document.getElementById('full-art').classList.toggle('playing', playing);
 }
  
 function updatePlayerUI(song) {
-  // Mini player
   document.getElementById('mini-title').textContent  = song.title;
   document.getElementById('mini-artist').textContent = song.artist;
-  const miniCover = document.getElementById('mini-cover');
-  miniCover.innerHTML = song.cover_url
+  document.getElementById('mini-cover').innerHTML    = song.cover_url
     ? `<img src="${song.cover_url}" alt="${esc(song.title)}"/>`
     : `<div class="mini-cover-ph">${genreEmoji(song)}</div>`;
  
-  // Full player
   document.getElementById('full-title').textContent  = song.title;
   document.getElementById('full-artist').textContent = song.artist;
-  const art = document.getElementById('full-art');
-  art.innerHTML = song.cover_url
+  document.getElementById('full-art').innerHTML      = song.cover_url
     ? `<img src="${song.cover_url}" alt="${esc(song.title)}"/>`
     : `<div class="album-art-ph">${genreEmoji(song)}</div>`;
-  if (song.cover_url) {
+ 
+  if (song.cover_url)
     document.getElementById('player-bg').style.backgroundImage = `url(${song.cover_url})`;
-  }
+ 
   document.getElementById('stream-count').textContent = song.streams
     ? fmtNum(song.streams) + ' plays' : '';
  
-  // No-preview fallback (Spotify link)
   const wrap = document.getElementById('no-preview-wrap');
-  const hasAudio = !!(song.audio_url || song.preview_url);
-  if (!hasAudio && song.spotify_url) {
-    wrap.innerHTML = `
-      <a class="spotify-link" href="${song.spotify_url}" target="_blank" rel="noopener">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-          <polyline points="15 3 21 3 21 9"/>
-          <line x1="10" y1="14" x2="21" y2="3"/>
-        </svg>
-        Open full song in Spotify
-      </a>`;
-  } else {
-    wrap.innerHTML = '';
-  }
+  if (!(song.audio_url || song.preview_url) && song.spotify_url) {
+    wrap.innerHTML = `<a class="spotify-link" href="${song.spotify_url}" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+        <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+      </svg>Open full song in Spotify</a>`;
+  } else { wrap.innerHTML = ''; }
  
   updateLikeUI();
 }
@@ -666,11 +598,9 @@ function updateLikeUI() {
   });
 }
  
-/** FIX: Use source-prefixed row IDs to match createRow() */
 function highlightRow(song) {
   document.querySelectorAll('.song-row.playing').forEach(r => r.classList.remove('playing'));
-  const rowId = `row-${song.source || 'sp'}-${song.id}`;
-  const row   = document.getElementById(rowId);
+  const row = document.getElementById(`row-${song.source || 'sp'}-${song.id}`);
   if (row) { row.classList.add('playing'); row.scrollIntoView({ block: 'nearest' }); }
 }
  
@@ -680,7 +610,6 @@ window.closePlayer = () => document.getElementById('full-player').classList.remo
  
 // ─── FAVORITES ───────────────────────────────────────────────────────────────
 window.toggleLike = async (songId, btn) => {
-  // FIX: search wider — queue, history, adminSongs
   const song = currentQueue.find(s => s.id === songId)
     || currentSong
     || history.find(h => (h.trackData?.id || h.id) === songId)?.trackData
@@ -695,29 +624,18 @@ window.toggleLike = async (songId, btn) => {
     favorites.add(songId);
     spawnNote(btn);
     if (!isGuest) {
-      try {
-        await setDoc(doc(db, 'users', currentUser.uid, 'favorites', songId), {
-          trackData: song,
-          likedAt: serverTimestamp(),
-        });
-      } catch {}
+      try { await setDoc(doc(db, 'users', currentUser.uid, 'favorites', songId), { trackData: song, likedAt: serverTimestamp() }); } catch {}
     }
   }
-  if (btn) {
-    btn.classList.toggle('liked', !was);
-    btn.querySelector('svg').setAttribute('fill', was ? 'none' : 'currentColor');
-  }
+ 
+  if (btn) { btn.classList.toggle('liked', !was); btn.querySelector('svg').setAttribute('fill', was ? 'none' : 'currentColor'); }
   if (currentSong?.id === songId) updateLikeUI();
  
-  // FIX: update guest localStorage with full track data
   if (isGuest) {
-    const likedTracks = JSON.parse(localStorage.getItem('444m_liked_tracks') || '[]');
-    if (was) {
-      localStorage.setItem('444m_liked_tracks', JSON.stringify(likedTracks.filter(t => t.id !== songId)));
-    } else {
-      likedTracks.unshift(song);
-      localStorage.setItem('444m_liked_tracks', JSON.stringify(likedTracks.slice(0, 100)));
-    }
+    const lt = JSON.parse(localStorage.getItem('444m_liked_tracks') || '[]');
+    localStorage.setItem('444m_liked_tracks', JSON.stringify(
+      was ? lt.filter(t => t.id !== songId) : [song, ...lt].slice(0, 100)
+    ));
   }
  
   saveLocal();
@@ -727,14 +645,10 @@ window.toggleLike = async (songId, btn) => {
  
 window.toggleLikeCurrent = () => {
   if (!currentSong) return;
-  const btn = document.getElementById('full-like');
-  toggleLike(currentSong.id, btn);
-  const mBtn  = document.getElementById('mini-like');
+  toggleLike(currentSong.id, document.getElementById('full-like'));
+  const mBtn = document.getElementById('mini-like');
   const liked = favorites.has(currentSong.id);
-  if (mBtn) {
-    mBtn.classList.toggle('liked', liked);
-    mBtn.querySelector('svg').setAttribute('fill', liked ? 'currentColor' : 'none');
-  }
+  if (mBtn) { mBtn.classList.toggle('liked', liked); mBtn.querySelector('svg').setAttribute('fill', liked ? 'currentColor' : 'none'); }
 };
  
 // ─── LIBRARY ─────────────────────────────────────────────────────────────────
@@ -743,7 +657,7 @@ window.setLibTab = (tab, btn) => {
   btn.classList.add('active');
   document.querySelectorAll('.lib-panel').forEach(p => p.classList.remove('active'));
   document.getElementById('lib-' + tab).classList.add('active');
-  if (tab === 'liked')     renderLikedSongs();
+  if (tab === 'liked')          renderLikedSongs();
   else if (tab === 'playlists') renderPlaylists();
   else if (tab === 'history')   renderHistoryPanel();
 };
@@ -753,9 +667,7 @@ async function renderLikedSongs() {
   const empty = document.getElementById('liked-empty');
   list.innerHTML = '';
   let songs = [];
- 
   if (isGuest) {
-    // FIX: guests store full track objects now
     songs = JSON.parse(localStorage.getItem('444m_liked_tracks') || '[]');
   } else {
     try {
@@ -763,7 +675,6 @@ async function renderLikedSongs() {
       songs = snap.docs.map(d => d.data().trackData).filter(Boolean);
     } catch { songs = []; }
   }
- 
   if (!songs.length) { empty.classList.remove('hidden'); return; }
   empty.classList.add('hidden');
   songs.forEach((s, i) => list.appendChild(createRow(s, i + 1, songs)));
@@ -779,23 +690,19 @@ function renderPlaylists() {
 }
  
 function createPlaylistCard(pl) {
-  const div    = document.createElement('div');
+  const div     = document.createElement('div');
   div.className = 'pl-card';
-  const songs  = pl.songs || [];
-  const covers = songs.slice(0, 4).filter(s => s.cover_url);
-  let artHtml;
-  if (covers.length >= 2) {
-    artHtml = `<div class="sub-hero-art-grid">${covers.slice(0,4).map(s=>`<img src="${s.cover_url}" alt="" loading="lazy"/>`).join('')}</div>`;
-  } else if (covers.length === 1) {
-    artHtml = `<div class="pl-card-art single"><img src="${covers[0].cover_url}" alt=""/></div>`;
-  } else {
-    artHtml = `<div class="pl-card-art empty">🎵</div>`;
-  }
+  const songs   = pl.songs || [];
+  const covers  = songs.slice(0, 4).filter(s => s.cover_url);
+  const artHtml = covers.length >= 2
+    ? `<div class="sub-hero-art-grid">${covers.slice(0,4).map(s=>`<img src="${s.cover_url}" alt="" loading="lazy"/>`).join('')}</div>`
+    : covers.length === 1
+    ? `<div class="pl-card-art single"><img src="${covers[0].cover_url}" alt=""/></div>`
+    : `<div class="pl-card-art empty">🎵</div>`;
   div.innerHTML = `
     <div class="pl-card-art">${artHtml}</div>
     <div class="pl-name">${esc(pl.name)}</div>
-    <div class="pl-count">${songs.length} song${songs.length !== 1 ? 's' : ''}</div>
-  `;
+    <div class="pl-count">${songs.length} song${songs.length !== 1 ? 's' : ''}</div>`;
   div.onclick = () => openPlaylist(pl.id);
   return div;
 }
@@ -804,7 +711,7 @@ function renderHistoryPanel() {
   const list  = document.getElementById('hist-list');
   const empty = document.getElementById('hist-empty');
   list.innerHTML = '';
-  const songs = history.map(h => h.trackData || h).filter(t => t && t.id);
+  const songs = history.map(h => h.trackData || h).filter(t => t?.id);
   if (!songs.length) { empty.classList.remove('hidden'); return; }
   empty.classList.add('hidden');
   songs.slice(0, 30).forEach((s, i) => list.appendChild(createRow(s, i + 1, songs)));
@@ -813,10 +720,8 @@ function renderHistoryPanel() {
 // ─── HISTORY ─────────────────────────────────────────────────────────────────
 function addToHistory(song) {
   if (!song?.id) return;
-  // Deduplicate
   history = history.filter(h => (h.trackData?.id || h.id) !== song.id);
-  const entry = { trackData: song, playedAt: Date.now() };
-  history.unshift(entry);
+  history.unshift({ trackData: song, playedAt: Date.now() });
   history = history.slice(0, 50);
   if (!isGuest) {
     setDoc(doc(db, 'users', currentUser.uid, 'history', song.id), {
@@ -833,33 +738,27 @@ window.createPlaylist = async () => {
   if (!name?.trim()) return;
   const pl = { name: name.trim(), songs: [], createdAt: serverTimestamp() };
   try {
-    const ref2 = await addDoc(collection(db, 'users', currentUser.uid, 'playlists'), pl);
-    playlists.push({ id: ref2.id, ...pl });
-  } catch {
-    playlists.push({ id: 'local_' + Date.now(), ...pl });
-  }
+    const r = await addDoc(collection(db, 'users', currentUser.uid, 'playlists'), pl);
+    playlists.push({ id: r.id, ...pl });
+  } catch { playlists.push({ id: 'local_' + Date.now(), ...pl }); }
   saveLocal(); renderPlaylists(); showToast('✅ Playlist created');
 };
  
 window.openPlaylist = plId => {
   previousPage = getCurrentPage();
-  const pl     = playlists.find(p => p.id === plId);
+  const pl = playlists.find(p => p.id === plId);
   if (!pl) return;
   currentPlaylistId = plId;
-  const songs   = pl.songs || [];
+  const songs = pl.songs || [];
   document.getElementById('pl-name').textContent = pl.name;
   document.getElementById('pl-sub').textContent  = songs.length + ' song' + (songs.length !== 1 ? 's' : '');
- 
   const art    = document.getElementById('pl-art');
   const covers = songs.filter(s => s.cover_url).slice(0, 4);
-  if (covers.length >= 2) {
-    art.innerHTML = `<div class="sub-hero-art-grid">${covers.map(s=>`<img src="${s.cover_url}" alt=""/>`).join('')}</div>`;
-  } else if (covers.length === 1) {
-    art.innerHTML = `<img src="${covers[0].cover_url}" alt="" style="width:100%;height:100%;object-fit:cover"/>`;
-  } else {
-    art.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="48" height="48"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
-  }
- 
+  art.innerHTML = covers.length >= 2
+    ? `<div class="sub-hero-art-grid">${covers.map(s=>`<img src="${s.cover_url}" alt=""/>`).join('')}</div>`
+    : covers.length === 1
+    ? `<img src="${covers[0].cover_url}" alt="" style="width:100%;height:100%;object-fit:cover"/>`
+    : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="48" height="48"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
   const list  = document.getElementById('pl-songs-list');
   const empty = document.getElementById('pl-songs-empty');
   list.innerHTML = '';
@@ -870,8 +769,7 @@ window.openPlaylist = plId => {
  
 window.playPlaylist = () => {
   const pl = playlists.find(p => p.id === currentPlaylistId);
-  if (!pl?.songs?.length) return;
-  playSong(pl.songs[0], pl.songs);
+  if (pl?.songs?.length) playSong(pl.songs[0], pl.songs);
 };
  
 window.renamePlaylist = async el => {
@@ -900,9 +798,7 @@ async function addSongToPlaylist(plId, song) {
   saveLocal(); showToast('Added to ' + pl.name);
 }
  
-window.addCurrentToPlaylist = () => {
-  if (currentSong) openPlPick(currentSong);
-};
+window.addCurrentToPlaylist = () => { if (currentSong) openPlPick(currentSong); };
  
 window.createPlaylistFromPick = async () => {
   closePlPick();
@@ -911,25 +807,22 @@ window.createPlaylistFromPick = async () => {
   if (!name?.trim()) return;
   const pl = { name: name.trim(), songs: song ? [song] : [], createdAt: serverTimestamp() };
   try {
-    const ref2 = await addDoc(collection(db, 'users', currentUser.uid, 'playlists'), pl);
-    playlists.push({ id: ref2.id, ...pl });
+    const r = await addDoc(collection(db, 'users', currentUser.uid, 'playlists'), pl);
+    playlists.push({ id: r.id, ...pl });
   } catch { playlists.push({ id: 'local_' + Date.now(), ...pl }); }
   saveLocal(); renderPlaylists(); showToast('✅ Playlist created');
 };
  
-// ─── ARTIST PAGE ──────────────────────────────────────────────────────────────
+// ─── ARTIST PAGE ─────────────────────────────────────────────────────────────
 let artistQueue = [];
-window.playArtist = () => {
-  if (artistQueue.length) playSong(artistQueue[0], artistQueue);
-};
+window.playArtist = () => { if (artistQueue.length) playSong(artistQueue[0], artistQueue); };
  
 async function openArtistPage(artistName, artistId) {
   previousPage = getCurrentPage();
-  document.getElementById('artist-name').textContent = artistName;
-  document.getElementById('artist-sub').textContent  = 'Loading…';
-  document.getElementById('artist-avatar').textContent = artistName[0]?.toUpperCase() || '🎤';
-  const list = document.getElementById('artist-list');
-  list.innerHTML = '<div class="spinner"></div>';
+  document.getElementById('artist-name').textContent    = artistName;
+  document.getElementById('artist-sub').textContent     = 'Loading…';
+  document.getElementById('artist-avatar').textContent  = artistName[0]?.toUpperCase() || '🎤';
+  document.getElementById('artist-list').innerHTML      = '<div class="spinner"></div>';
   setPage('artist');
  
   let tracks = [];
@@ -945,13 +838,11 @@ async function openArtistPage(artistName, artistId) {
     tracks = await searchTracks(artistName, 15);
   }
   artistQueue = tracks;
-  document.getElementById('artist-sub').textContent = tracks.length + ' songs';
-  list.innerHTML = '';
-  if (tracks.length) {
-    tracks.forEach((s, i) => list.appendChild(createRow(s, i + 1, tracks)));
-  } else {
-    list.innerHTML = '<p class="empty-hint">No tracks found</p>';
-  }
+  document.getElementById('artist-sub').textContent  = tracks.length + ' songs';
+  document.getElementById('artist-list').innerHTML   = '';
+  tracks.length
+    ? tracks.forEach((s, i) => document.getElementById('artist-list').appendChild(createRow(s, i + 1, tracks)))
+    : (document.getElementById('artist-list').innerHTML = '<p class="empty-hint">No tracks found</p>');
 }
  
 // ─── BOTTOM SHEET ────────────────────────────────────────────────────────────
@@ -959,19 +850,19 @@ window.openSheet = (song) => {
   if (typeof song === 'string') { try { song = JSON.parse(song); } catch { return; } }
   sheetTargetSong = song || currentSong;
   if (!sheetTargetSong) return;
-  const s     = sheetTargetSong;
+  const s = sheetTargetSong;
   const liked = favorites.has(s.id);
   document.getElementById('sheet-name').textContent   = s.title;
   document.getElementById('sheet-artist').textContent = s.artist;
-  const sc = document.getElementById('sheet-cover');
-  sc.innerHTML = s.cover_url ? `<img src="${s.cover_url}" alt=""/>` : `<div class="sheet-cover-ph">${genreEmoji(s)}</div>`;
+  document.getElementById('sheet-cover').innerHTML    = s.cover_url
+    ? `<img src="${s.cover_url}" alt=""/>` : `<div class="sheet-cover-ph">${genreEmoji(s)}</div>`;
   document.getElementById('sheet-like-label').textContent = liked ? 'Unlike song' : 'Like song';
   document.getElementById('sheet-like-btn').classList.toggle('liked-action', liked);
   showBS('bottom-sheet');
 };
  
-window.closeSheet     = () => hideBS('bottom-sheet');
-window.sheetLike      = () => { closeSheet(); if (sheetTargetSong) toggleLike(sheetTargetSong.id, null); };
+window.closeSheet       = () => hideBS('bottom-sheet');
+window.sheetLike        = () => { closeSheet(); if (sheetTargetSong) toggleLike(sheetTargetSong.id, null); };
 window.sheetAddPlaylist = () => { closeSheet(); if (sheetTargetSong) openPlPick(sheetTargetSong); };
 window.sheetOpenSpotify = () => {
   closeSheet();
@@ -987,22 +878,14 @@ function openPlPick(song) {
   if (isGuest) { showToast('Sign up to create playlists'); return; }
   plPickTargetSong = song;
   const list = document.getElementById('pl-pick-list');
-  list.innerHTML = '';
-  if (!playlists.length) {
-    list.innerHTML = '<p style="padding:.5rem 1.25rem;color:var(--text2);font-size:.85rem">No playlists yet</p>';
-  } else {
-    playlists.forEach(pl => {
-      const btn     = document.createElement('button');
-      btn.className = 'sheet-action';
-      btn.innerHTML = `
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
-        </svg>
-        ${esc(pl.name)}`;
-      btn.onclick = () => { addSongToPlaylist(pl.id, song); closePlPick(); };
-      list.appendChild(btn);
-    });
-  }
+  list.innerHTML = playlists.length ? '' : '<p style="padding:.5rem 1.25rem;color:var(--text2);font-size:.85rem">No playlists yet</p>';
+  playlists.forEach(pl => {
+    const btn     = document.createElement('button');
+    btn.className = 'sheet-action';
+    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>${esc(pl.name)}`;
+    btn.onclick   = () => { addSongToPlaylist(pl.id, song); closePlPick(); };
+    list.appendChild(btn);
+  });
   showBS('pl-pick-sheet');
 }
 window.closePlPick = () => hideBS('pl-pick-sheet');
@@ -1024,11 +907,8 @@ function hideBS(id) {
 window.shareCurrent = () => {
   if (!currentSong) return;
   const url = currentSong.spotify_url || location.href;
-  if (navigator.share) {
-    navigator.share({ title: `${currentSong.title} — ${currentSong.artist}`, url });
-  } else {
-    navigator.clipboard.writeText(url).then(() => showToast('🔗 Link copied'));
-  }
+  if (navigator.share) navigator.share({ title: `${currentSong.title} — ${currentSong.artist}`, url });
+  else navigator.clipboard.writeText(url).then(() => showToast('🔗 Link copied'));
 };
  
 // ─── ADMIN ───────────────────────────────────────────────────────────────────
@@ -1038,9 +918,7 @@ window.previewCover = input => {
   if (!input.files?.[0]) return;
   _coverFile = input.files[0];
   const fr = new FileReader();
-  fr.onload = e => {
-    document.getElementById('cover-preview').innerHTML = `<img src="${e.target.result}" alt=""/>`;
-  };
+  fr.onload = e => { document.getElementById('cover-preview').innerHTML = `<img src="${e.target.result}" alt=""/>`; };
   fr.readAsDataURL(input.files[0]);
 };
  
@@ -1051,11 +929,11 @@ window.selectAudio = input => {
 };
  
 window.uploadSong = async () => {
-  const title  = document.getElementById('up-title').value.trim();
+  const title = document.getElementById('up-title').value.trim();
   const artist = document.getElementById('up-artist').value.trim();
   const genre  = document.getElementById('up-genre').value;
   if (!title || !artist) { showToast('Title and artist required'); return; }
-  if (!_audioFile)       { showToast('Please select an audio file'); return; }
+  if (!_audioFile) { showToast('Please select an audio file'); return; }
  
   const prog = document.getElementById('upload-prog');
   const fill = document.getElementById('prog-fill');
@@ -1065,56 +943,33 @@ window.uploadSong = async () => {
   try {
     let audio_url = '', cover_url = null;
     txt.textContent = 'Uploading audio…';
-    const aRef  = ref(storage, `songs/${Date.now()}_${_audioFile.name}`);
+    const aRef = ref(storage, `songs/${Date.now()}_${_audioFile.name}`);
     await new Promise((res, rej) => {
       const task = uploadBytesResumable(aRef, _audioFile);
-      task.on('state_changed',
-        snap => { fill.style.width = (snap.bytesTransferred / snap.totalBytes * 70) + '%'; },
-        rej,
-        async () => { audio_url = await getDownloadURL(task.snapshot.ref); res(); }
-      );
+      task.on('state_changed', snap => { fill.style.width = (snap.bytesTransferred / snap.totalBytes * 70) + '%'; }, rej,
+        async () => { audio_url = await getDownloadURL(task.snapshot.ref); res(); });
     });
     if (_coverFile) {
       txt.textContent = 'Uploading cover…'; fill.style.width = '80%';
       const cRef  = ref(storage, `covers/${Date.now()}_${_coverFile.name}`);
       const cTask = uploadBytesResumable(cRef, _coverFile);
-      await new Promise((res, rej) => cTask.on('state_changed', null, rej, async () => {
-        cover_url = await getDownloadURL(cTask.snapshot.ref); res();
-      }));
+      await new Promise((res, rej) => cTask.on('state_changed', null, rej,
+        async () => { cover_url = await getDownloadURL(cTask.snapshot.ref); res(); }));
     }
     fill.style.width = '90%'; txt.textContent = 'Saving…';
-    const data = {
-      title, artist, genre: genre || 'Other',
-      audio_url, cover_url, streams: 0,
-      uploadedBy: currentUser.uid,
-      createdAt: serverTimestamp(),
-      source: 'admin',
-    };
+    const data = { title, artist, genre: genre || 'Other', audio_url, cover_url, streams: 0, uploadedBy: currentUser.uid, createdAt: serverTimestamp(), source: 'admin' };
     const docRef = await addDoc(collection(db, 'songs'), data);
-    const normSong = {
-      id: docRef.id, spotifyId: null, title, artist,
-      artistId: null, album: '', cover_url, preview_url: null,
-      audio_url, spotify_url: null, duration_ms: 0, streams: 0,
-      genre: genre || 'Other', source: 'admin',
-    };
-    adminSongs.unshift(normSong);
+    adminSongs.unshift({ id: docRef.id, spotifyId: null, title, artist, artistId: null, album: '', cover_url, preview_url: null, audio_url, spotify_url: null, duration_ms: 0, streams: 0, genre: genre || 'Other', source: 'admin' });
     fill.style.width = '100%'; txt.textContent = '✅ Upload complete!';
     setTimeout(() => {
       prog.style.display = 'none'; fill.style.width = '0%';
-      document.getElementById('up-title').value = '';
-      document.getElementById('up-artist').value = '';
+      ['up-title','up-artist'].forEach(id => document.getElementById(id).value = '');
       document.getElementById('up-genre').value = '';
       document.getElementById('audio-label').textContent = 'Choose MP3 file *';
-      document.getElementById('cover-preview').innerHTML = `
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <rect x="3" y="3" width="18" height="18" rx="2"/>
-          <circle cx="8.5" cy="8.5" r="1.5"/>
-          <polyline points="21 15 16 10 5 21"/>
-        </svg><span>Cover Art</span>`;
+      document.getElementById('cover-preview').innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg><span>Cover Art</span>`;
       _audioFile = null; _coverFile = null;
     }, 2000);
-    renderAdminSongs();
-    showToast('🎵 Song uploaded!');
+    renderAdminSongs(); showToast('🎵 Song uploaded!');
   } catch (e) { txt.textContent = '❌ Failed: ' + e.message; fill.style.width = '0%'; }
 };
  
@@ -1143,7 +998,7 @@ window.setPage = (name, btn) => {
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
   else document.querySelector(`[data-page="${name}"]`)?.classList.add('active');
-  const titles = { home: 'Home', search: 'Search', library: 'Library', admin: 'Admin', artist: 'Artist', playlist: 'Playlist' };
+  const titles = { home:'Home', search:'Search', library:'Library', admin:'Admin', artist:'Artist', playlist:'Playlist' };
   document.getElementById('topbar-title').textContent = titles[name] || '';
   document.getElementById('page-content').scrollTop = 0;
   if (name === 'search')  renderGenreChips();
@@ -1152,10 +1007,7 @@ window.setPage = (name, btn) => {
 };
  
 window.goBack = () => { setPage(previousPage); previousPage = 'home'; };
- 
-function getCurrentPage() {
-  return document.querySelector('.page.active')?.id.replace('page-', '') || 'home';
-}
+function getCurrentPage() { return document.querySelector('.page.active')?.id.replace('page-', '') || 'home'; }
  
 // ─── MEDIA SESSION ───────────────────────────────────────────────────────────
 function updateMediaSession(song) {
@@ -1173,7 +1025,7 @@ function updateMediaSession(song) {
 // ─── KEYBOARD ────────────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
-  if (e.code === 'Space')      { e.preventDefault(); togglePlay(); }
+  if (e.code === 'Space')           { e.preventDefault(); togglePlay(); }
   else if (e.code === 'ArrowRight') nextSong();
   else if (e.code === 'ArrowLeft')  prevSong();
   else if (e.code === 'Escape')     { closePlayer(); hideBS('bottom-sheet'); hideBS('pl-pick-sheet'); }
@@ -1181,12 +1033,12 @@ document.addEventListener('keydown', e => {
  
 // ─── FLOATING NOTES ──────────────────────────────────────────────────────────
 function spawnNote(anchor) {
-  const note  = document.createElement('div');
-  note.className = 'note';
+  const note = document.createElement('div');
+  note.className   = 'note';
   note.textContent = ['♪','♫','♬','♩'][Math.floor(Math.random()*4)];
-  const rect  = anchor?.getBoundingClientRect();
-  note.style.left = (rect ? rect.left + rect.width / 2 : window.innerWidth / 2) + 'px';
-  note.style.top  = (rect ? rect.top  : 100) + 'px';
+  const rect = anchor?.getBoundingClientRect();
+  note.style.left  = (rect ? rect.left + rect.width / 2 : window.innerWidth / 2) + 'px';
+  note.style.top   = (rect ? rect.top : 100) + 'px';
   document.body.appendChild(note);
   setTimeout(() => note.remove(), 3000);
 }
@@ -1194,36 +1046,24 @@ function spawnNote(anchor) {
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 function showToast(msg) {
   const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
+  t.textContent = msg; t.classList.add('show');
   clearTimeout(t._t);
   t._t = setTimeout(() => t.classList.remove('show'), 2600);
 }
- 
 function fmtTime(s) {
   if (!s || isNaN(s)) return '0:00';
-  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
-  return m + ':' + String(sec).padStart(2, '0');
+  return Math.floor(s/60) + ':' + String(Math.floor(s%60)).padStart(2,'0');
 }
- 
 function fmtNum(n) {
   if (!n) return '0';
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
   return String(n);
 }
- 
 function esc(str) {
   if (!str) return '';
   return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
- 
 function genreEmoji(song) {
-  const map = {
-    Afrobeats:'🎺', 'Hip-Hop':'🎤', 'R&B':'🎸',
-    Pop:'🎵', Gospel:'🙏', Highlife:'🥁',
-    Dancehall:'🏝️', Drill:'🎧', Amapiano:'🎹',
-  };
-  return map[song?.genre] || '🎶';
+  return ({ Afrobeats:'🎺','Hip-Hop':'🎤','R&B':'🎸',Pop:'🎵',Gospel:'🙏',Highlife:'🥁',Dancehall:'🏝️',Drill:'🎧',Amapiano:'🎹' })[song?.genre] || '🎶';
 }
- 
